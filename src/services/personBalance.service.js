@@ -1,3 +1,4 @@
+import mongoose from 'mongoose';
 import { round2 } from '../models/shared/money.js';
 
 /**
@@ -54,12 +55,30 @@ import { round2 } from '../models/shared/money.js';
  * supplierBalance.service.js each hardcode the correct value for their own
  * entity type so this can never be passed wrong from a call site.
  *
+ * `PaymentModel`'s `discount` (optional, Customer-only for now —
+ * CustomerPayment.discount): a settlement/write-off recorded alongside a
+ * real payment (see customerPayment.service.js) — reduces this raw figure
+ * exactly like `amount` does (both were forgiven-or-collected against the
+ * same debt), but is summed as its own separate term here so it's never
+ * confused with real cash collected. Safe to sum unconditionally even for
+ * models with no such field (SupplierPayment): a missing field contributes
+ * nothing to a MongoDB `$sum`, so this is exactly 0 for every supplier.
+ *
+ * `TransferModel` (optional, Customer-only — CustomerDebtTransfer): debt
+ * moved between two customers (see customerDebtTransfer.service.js). For
+ * THIS person it contributes `- (transferred OUT of this person) +
+ * (transferred IN to this person)` — a pure re-assignment of who owes what,
+ * never a payment, never a sale, never a cashbox movement. Must stay
+ * identical to personService.js's getTotals/list and reports.service.js's
+ * getPersonBalanceReport (this project computes the same balance in four
+ * places; every term has to be added to all four in the same change).
+ *
  * `session` is required (not optional) — every caller runs inside a
  * transaction anyway (see withTransaction in the callers), and a balance
  * check for money movement outside a transaction would defeat the whole
  * point of reading it consistently with the write that follows.
  */
-export async function getPersonRemaining({ TransactionModel, PaymentModel, ReturnModel, PayoutModel, PersonModel, openingBalancePositiveDirection, refField, personId, session }) {
+export async function getPersonRemaining({ TransactionModel, PaymentModel, ReturnModel, PayoutModel, TransferModel, PersonModel, openingBalancePositiveDirection, refField, personId, session }) {
   const [txAgg] = await TransactionModel.aggregate([
     { $match: { [refField]: personId } },
     { $group: { _id: null, total: { $sum: '$total' }, paid: { $sum: '$paid' } } },
@@ -69,9 +88,10 @@ export async function getPersonRemaining({ TransactionModel, PaymentModel, Retur
 
   const [paymentsAgg] = await PaymentModel.aggregate([
     { $match: { [refField]: personId } },
-    { $group: { _id: null, paid: { $sum: '$amount' } } },
+    { $group: { _id: null, paid: { $sum: '$amount' }, discount: { $sum: '$discount' } } },
   ]).session(session);
   const priorPayments = paymentsAgg?.paid || 0;
+  const priorPaymentDiscounts = paymentsAgg?.discount || 0;
 
   const [returnsAgg] = await ReturnModel.aggregate([
     { $match: { [refField]: personId } },
@@ -88,6 +108,24 @@ export async function getPersonRemaining({ TransactionModel, PaymentModel, Retur
     priorPayouts = payoutsAgg?.paidOut || 0;
   }
 
+  let transferredOut = 0;
+  let transferredIn = 0;
+  if (TransferModel) {
+    const pid = new mongoose.Types.ObjectId(personId);
+    const [transfersAgg] = await TransferModel.aggregate([
+      { $match: { $or: [{ fromCustomerId: pid }, { toCustomerId: pid }] } },
+      {
+        $group: {
+          _id: null,
+          out: { $sum: { $cond: [{ $eq: ['$fromCustomerId', pid] }, '$amount', 0] } },
+          in: { $sum: { $cond: [{ $eq: ['$toCustomerId', pid] }, '$amount', 0] } },
+        },
+      },
+    ]).session(session);
+    transferredOut = transfersAgg?.out || 0;
+    transferredIn = transfersAgg?.in || 0;
+  }
+
   let openingBalanceSigned = 0;
   if (PersonModel) {
     const person = await PersonModel.findById(personId).select('openingBalance').session(session);
@@ -95,7 +133,7 @@ export async function getPersonRemaining({ TransactionModel, PaymentModel, Retur
     if (ob?.amount) openingBalanceSigned = ob.direction === openingBalancePositiveDirection ? ob.amount : -ob.amount;
   }
 
-  return round2(openingBalanceSigned + txTotal - txPaid - priorPayments - priorReturns + priorPayouts);
+  return round2(openingBalanceSigned + txTotal - txPaid - priorPayments - priorPaymentDiscounts - priorReturns + priorPayouts - transferredOut + transferredIn);
 }
 
 export default getPersonRemaining;

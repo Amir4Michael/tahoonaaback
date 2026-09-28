@@ -9,6 +9,7 @@ import SupplierPayment from '../models/SupplierPayment.js';
 import SalesReturn from '../models/SalesReturn.js';
 import PurchaseReturn from '../models/PurchaseReturn.js';
 import CustomerCreditPayout from '../models/CustomerCreditPayout.js';
+import CustomerDebtTransfer from '../models/CustomerDebtTransfer.js';
 import SupplierCreditReceipt from '../models/SupplierCreditReceipt.js';
 import { cairoRangeMatch } from '../utils/timezone.js';
 import { round2 } from '../models/shared/money.js';
@@ -74,12 +75,18 @@ function dateRangeMatch(from, to) {
  * why, and for the confirmed bug this parameterization fixes: a customer's
  * raw remaining is positive when THEY owe MORE, a supplier's is positive
  * when WE owe MORE, so the same direction label pushes them opposite ways).
+ * `TransferModel` (optional, Customer-only — CustomerDebtTransfer): debt
+ * moved between two customers (see customerDebtTransfer.service.js), folded
+ * in as `- transferred out + transferred in` exactly like personService.js /
+ * personBalance.service.js. It moves debt from one row of this report to
+ * another, so the report's total outstanding is unchanged by a transfer.
+ *
  * See Customer.js/Supplier.js for why this can never be a Sale/Purchase/
  * CashboxTransaction — it must never appear in any OTHER report (Sales/
  * Purchases/Profit/Inventory all remain completely untouched by it), only
  * in this one person's own balance.
  */
-async function getPersonBalanceReport(Model, TransactionModel, refField, limit, PaymentModel, ReturnModel, PayoutModel, openingBalancePositiveDirection) {
+async function getPersonBalanceReport(Model, TransactionModel, refField, limit, PaymentModel, ReturnModel, PayoutModel, openingBalancePositiveDirection, TransferModel) {
   const pipeline = [
     {
       $lookup: {
@@ -108,6 +115,11 @@ async function getPersonBalanceReport(Model, TransactionModel, refField, limit, 
         },
       },
       { $addFields: { paid: { $add: ['$paid', { $sum: '$_payments.amount' }] } } },
+      // Settlements/write-offs (Customer only for now — see
+      // CustomerPayment.discount) — kept OUT of `paid` (that figure means
+      // "cash collected" wherever it's shown) and folded into `remaining`
+      // separately below instead, alongside opening balance.
+      { $addFields: { settlementsGiven: { $sum: '$_payments.discount' } } },
     );
   }
 
@@ -142,25 +154,62 @@ async function getPersonBalanceReport(Model, TransactionModel, refField, limit, 
   pipeline.push({
     $addFields: {
       remaining: {
-        $add: [
-          ReturnModel
-            ? { $subtract: [{ $subtract: ['$total', '$paid'] }, '$returned'] }
-            : { $subtract: ['$total', '$paid'] },
-          PayoutModel ? '$paidOut' : 0,
-          // Opening balance — same signed contribution as
-          // personService.js/personBalance.service.js, relative to
-          // openingBalancePositiveDirection.
+        $subtract: [
           {
-            $cond: [
-              { $eq: ['$openingBalance.direction', openingBalancePositiveDirection] },
-              { $ifNull: ['$openingBalance.amount', 0] },
-              { $multiply: [{ $ifNull: ['$openingBalance.amount', 0] }, -1] },
+            $add: [
+              ReturnModel
+                ? { $subtract: [{ $subtract: ['$total', '$paid'] }, '$returned'] }
+                : { $subtract: ['$total', '$paid'] },
+              PayoutModel ? '$paidOut' : 0,
+              // Opening balance — same signed contribution as
+              // personService.js/personBalance.service.js, relative to
+              // openingBalancePositiveDirection.
+              {
+                $cond: [
+                  { $eq: ['$openingBalance.direction', openingBalancePositiveDirection] },
+                  { $ifNull: ['$openingBalance.amount', 0] },
+                  { $multiply: [{ $ifNull: ['$openingBalance.amount', 0] }, -1] },
+                ],
+              },
             ],
           },
+          { $ifNull: ['$settlementsGiven', 0] },
         ],
       },
     },
   });
+
+  // Debt transfers between customers — `- out + in`, same as personService.js.
+  if (TransferModel) {
+    pipeline.push(
+      {
+        $lookup: {
+          from: TransferModel.collection.name,
+          localField: '_id',
+          foreignField: 'fromCustomerId',
+          as: '_transfersOut',
+        },
+      },
+      {
+        $lookup: {
+          from: TransferModel.collection.name,
+          localField: '_id',
+          foreignField: 'toCustomerId',
+          as: '_transfersIn',
+        },
+      },
+      {
+        $addFields: {
+          remaining: {
+            $add: [
+              '$remaining',
+              { $subtract: [{ $sum: '$_transfersIn.amount' }, { $sum: '$_transfersOut.amount' }] },
+            ],
+          },
+        },
+      },
+    );
+  }
 
   // Floor at 0 — always applied now (opening balance alone, even with no
   // ReturnModel/PayoutModel, can push remaining negative), matching
@@ -168,7 +217,7 @@ async function getPersonBalanceReport(Model, TransactionModel, refField, limit, 
   pipeline.push({ $addFields: { remaining: { $cond: [{ $lt: ['$remaining', 0] }, 0, '$remaining'] } } });
 
   pipeline.push(
-    { $project: { _tx: 0, _payments: 0, _returns: 0, _payouts: 0 } },
+    { $project: { _tx: 0, _payments: 0, _returns: 0, _payouts: 0, _transfersOut: 0, _transfersIn: 0 } },
     {
       $facet: {
         summary: [
@@ -178,6 +227,11 @@ async function getPersonBalanceReport(Model, TransactionModel, refField, limit, 
               count: { $sum: 1 },
               totalOutstanding: { $sum: '$remaining' },
               withBalanceCount: { $sum: { $cond: [{ $gt: ['$remaining', 0] }, 1, 0] } },
+              // Total settlements/write-offs given across everyone (Customer
+              // only for now) — surfaced as its own figure so it stays
+              // visible in the report rather than silently vanishing into
+              // totalOutstanding (see this function's own docstring).
+              totalSettlements: { $sum: { $ifNull: ['$settlementsGiven', 0] } },
             },
           },
         ],
@@ -188,7 +242,7 @@ async function getPersonBalanceReport(Model, TransactionModel, refField, limit, 
 
   const [result] = await Model.aggregate(pipeline);
 
-  const summary = result.summary[0] || { count: 0, totalOutstanding: 0, withBalanceCount: 0 };
+  const summary = result.summary[0] || { count: 0, totalOutstanding: 0, withBalanceCount: 0, totalSettlements: 0 };
   return { ...summary, top: result.top };
 }
 
@@ -620,11 +674,11 @@ export async function getInventoryReport() {
 }
 
 export async function getCustomersReport({ limit = 8 } = {}) {
-  const { count, totalOutstanding, withBalanceCount, top } = await getPersonBalanceReport(Customer, Sale, 'customerId', limit, CustomerPayment, SalesReturn, CustomerCreditPayout, 'they_owe_us');
-  return { count, totalOutstanding, withBalanceCount, topCustomers: top };
+  const { count, totalOutstanding, withBalanceCount, totalSettlements, top } = await getPersonBalanceReport(Customer, Sale, 'customerId', limit, CustomerPayment, SalesReturn, CustomerCreditPayout, 'they_owe_us', CustomerDebtTransfer);
+  return { count, totalOutstanding, withBalanceCount, totalSettlements, topCustomers: top };
 }
 
 export async function getSuppliersReport({ limit = 8 } = {}) {
-  const { count, totalOutstanding, withBalanceCount, top } = await getPersonBalanceReport(Supplier, Purchase, 'supplierId', limit, SupplierPayment, PurchaseReturn, SupplierCreditReceipt, 'we_owe_them');
-  return { count, totalOutstanding, withBalanceCount, topSuppliers: top };
+  const { count, totalOutstanding, withBalanceCount, totalSettlements, top } = await getPersonBalanceReport(Supplier, Purchase, 'supplierId', limit, SupplierPayment, PurchaseReturn, SupplierCreditReceipt, 'we_owe_them');
+  return { count, totalOutstanding, withBalanceCount, totalSettlements, topSuppliers: top };
 }
