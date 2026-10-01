@@ -21,9 +21,14 @@ vi.mock('../../src/services/cashbox.service.js', () => ({
   getSummary: vi.fn(),
   createCashTransaction: vi.fn(),
 }));
+vi.mock('../../src/services/dailyReport.service.js', () => ({
+  getDailyReport: vi.fn(),
+}));
+
 vi.mock('../../src/services/expense.service.js', () => ({
   listExpenses: vi.fn(),
   getSummary: vi.fn(),
+  getDistinctReasons: vi.fn(),
   createExpense: vi.fn(),
   deleteExpense: vi.fn(),
 }));
@@ -58,6 +63,8 @@ const productService = await import('../../src/services/product.service.js');
 const saleService = await import('../../src/services/sale.service.js');
 const cashboxService = await import('../../src/services/cashbox.service.js');
 const reportsService = await import('../../src/services/reports.service.js');
+const expenseService = await import('../../src/services/expense.service.js');
+const dailyReportService = await import('../../src/services/dailyReport.service.js');
 const { customerService } = await import('../../src/services/customer.service.js');
 const { createApp } = await import('../../src/app.js');
 
@@ -115,6 +122,8 @@ describe('/api/admin is strictly read-only', () => {
       request(app).delete(`/api/admin/expenses/${id}`).set(adminHeader()),
       request(app).patch('/api/admin/settings').set(adminHeader()).send({ shopName: 'x' }),
       request(app).post(`/api/admin/customers`).set(adminHeader()).send({ name: 'x' }),
+      request(app).post('/api/admin/expenses/reasons').set(adminHeader()).send({ reason: 'x' }),
+      request(app).post('/api/admin/reports/daily').set(adminHeader()).send({}),
     ]);
 
     // Express falls through to notFoundHandler (404) for a verb with no
@@ -183,5 +192,104 @@ describe('/api/admin data coverage', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.data.totalProfit).toBe(1000);
+  });
+});
+
+describe('/api/admin expense reasons (for System 5\'s expense filter)', () => {
+  it('returns the distinct reasons via the same service the shop\'s own ExpensesPage uses', async () => {
+    expenseService.getDistinctReasons.mockResolvedValue(['إيجار', 'كهرباء']);
+
+    const app = createApp();
+    const res = await request(app).get('/api/admin/expenses/reasons').set(adminHeader());
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ success: true, data: ['إيجار', 'كهرباء'] });
+    expect(expenseService.getDistinctReasons).toHaveBeenCalledTimes(1);
+  });
+
+  it('is gated by the admin key like every other admin route', async () => {
+    const app = createApp();
+    const res = await request(app).get('/api/admin/expenses/reasons');
+
+    expect(res.status).toBe(401);
+    expect(expenseService.getDistinctReasons).not.toHaveBeenCalled();
+  });
+
+  it('does not shadow /expenses/summary', async () => {
+    expenseService.getSummary.mockResolvedValue({ total: 10 });
+
+    const app = createApp();
+    const res = await request(app).get('/api/admin/expenses/summary').set(adminHeader());
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.total).toBe(10);
+    expect(expenseService.getDistinctReasons).not.toHaveBeenCalled();
+  });
+});
+
+describe('/api/admin rate limit', () => {
+  it('no longer blocks System 5 after 60 requests (the old cap)', async () => {
+    productService.listProducts.mockResolvedValue({ items: [], pagination: { page: 1, limit: 20, total: 0, totalPages: 0 } });
+
+    const app = createApp();
+    const statuses = [];
+    for (let i = 0; i < 75; i += 1) {
+      const res = await request(app).get('/api/admin/products').set(adminHeader());
+      statuses.push(res.status);
+    }
+
+    expect(statuses.filter((s) => s === 429)).toHaveLength(0);
+    expect(statuses.every((s) => s === 200)).toBe(true);
+  });
+
+  it('still caps the admin router (at 300 per 15 minutes)', async () => {
+    const { ADMIN_RATE_LIMIT_MAX } = await import('../../src/routes/admin.route.js');
+    productService.listProducts.mockResolvedValue({ items: [], pagination: { page: 1, limit: 20, total: 0, totalPages: 0 } });
+
+    const app = createApp();
+    const res = await request(app).get('/api/admin/products').set(adminHeader());
+
+    expect(ADMIN_RATE_LIMIT_MAX).toBe(300);
+    expect(res.headers['ratelimit-limit']).toBe(String(ADMIN_RATE_LIMIT_MAX));
+    // The admin router (and its limiter) is a module-level singleton shared
+    // by every createApp() in this file, so earlier tests already consumed
+    // part of the window — only assert it is counting down from the cap.
+    expect(Number(res.headers['ratelimit-remaining'])).toBeLessThan(ADMIN_RATE_LIMIT_MAX);
+  });
+
+  it('does not change the limits on the shop\'s own (non-admin) routes', async () => {
+    const app = createApp();
+    const res = await request(app).get('/api/health');
+
+    expect(res.headers['ratelimit-limit']).toBe('300'); // app-wide limiter, unchanged
+  });
+});
+
+describe('/api/admin/reports/daily (System 5 trend charts)', () => {
+  it('returns the day-by-day series for the range', async () => {
+    dailyReportService.getDailyReport.mockResolvedValue({ from: '2026-09-01', to: '2026-09-02', days: [{ date: '2026-09-01' }] });
+
+    const app = createApp();
+    const res = await request(app).get('/api/admin/reports/daily?from=2026-09-01&to=2026-09-02').set(adminHeader());
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.days).toHaveLength(1);
+    expect(dailyReportService.getDailyReport).toHaveBeenCalledWith({ from: '2026-09-01', to: '2026-09-02' });
+  });
+
+  it('requires both dates in YYYY-MM-DD', async () => {
+    const app = createApp();
+    const missing = await request(app).get('/api/admin/reports/daily?from=2026-09-01').set(adminHeader());
+    const bad = await request(app).get('/api/admin/reports/daily?from=1-9-2026&to=2026-09-02').set(adminHeader());
+
+    expect(missing.status).toBe(400);
+    expect(bad.status).toBe(400);
+    expect(dailyReportService.getDailyReport).not.toHaveBeenCalled();
+  });
+
+  it('is gated by the admin key', async () => {
+    const app = createApp();
+    const res = await request(app).get('/api/admin/reports/daily?from=2026-09-01&to=2026-09-02');
+    expect(res.status).toBe(401);
   });
 });
